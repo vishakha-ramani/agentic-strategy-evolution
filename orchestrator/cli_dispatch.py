@@ -159,7 +159,7 @@ class CLIDispatcher(LLMDispatcher):
                     "Parse failed for %s/%s (%s), retrying with feedback.",
                     role, phase, exc,
                 )
-                data = self._retry_cli_parse(prompt, exc, fmt)
+                data = self._retry_cli_parse(response, exc, fmt)
 
             if schema_name is not None:
                 try:
@@ -169,7 +169,7 @@ class CLIDispatcher(LLMDispatcher):
                         "Schema validation failed for %s/%s, retrying: %s",
                         role, phase, exc.message,
                     )
-                    data = self._retry_cli_schema(prompt, exc, fmt, schema_name)
+                    data = self._retry_cli_schema(response, exc, fmt, schema_name)
 
             if fmt == "yaml":
                 atomic_write(
@@ -181,14 +181,14 @@ class CLIDispatcher(LLMDispatcher):
 
         logger.info("CLIDispatcher: role=%s phase=%s -> %s", role, phase, output_path)
 
-    def _retry_cli_parse(self, original_prompt: str, error: Exception, fmt: str) -> dict:
+    def _retry_cli_parse(self, previous_response: str, error: Exception, fmt: str) -> dict:
         feedback = (
             f"Your previous response could not be parsed.\n\n"
             f"Error: {error}\n\n"
             f"Please output ONLY a ```{fmt}``` code fence with valid "
             f"{fmt.upper()} inside. No explanation outside the fence."
         )
-        response = self._call_claude(f"{original_prompt}\n\n---\n\n{feedback}")
+        response = self._call_claude(f"{previous_response}\n\n---\n\n{feedback}")
         try:
             return self._extract_fenced_content(response, fmt)
         except (json.JSONDecodeError, yaml.YAMLError, ValueError) as exc:
@@ -197,7 +197,7 @@ class CLIDispatcher(LLMDispatcher):
             ) from exc
 
     def _retry_cli_schema(
-        self, original_prompt: str, error: jsonschema.ValidationError,
+        self, previous_response: str, error: jsonschema.ValidationError,
         fmt: str, schema_name: str,
     ) -> dict:
         feedback = (
@@ -205,7 +205,7 @@ class CLIDispatcher(LLMDispatcher):
             f"Please fix the issue and return only the corrected "
             f"{fmt} in a code fence."
         )
-        response = self._call_claude(f"{original_prompt}\n\n---\n\n{feedback}")
+        response = self._call_claude(f"{previous_response}\n\n---\n\n{feedback}")
         try:
             data = self._extract_fenced_content(response, fmt)
         except (json.JSONDecodeError, yaml.YAMLError, ValueError) as exc:

@@ -692,3 +692,85 @@ class TestIsTransientClassifier:
         """api_error_status 5xx is transient even if is_error is absent/False."""
         from orchestrator.cli_dispatch import _is_transient
         assert _is_transient({"is_error": False, "api_error_status": 503, "result": ""})
+
+
+class TestCLIParseRetryDelta:
+    """Retry methods must send the previous-response delta, not re-send the full prompt."""
+
+    def test_retry_cli_parse_prompt_starts_with_previous_response(
+        self, work_dir: Path, campaign: dict,
+    ) -> None:
+        from unittest.mock import patch
+        from orchestrator.cli_dispatch import CLIDispatcher
+
+        previous_bad = "SENTINEL_BAD_RESPONSE_no_fence_here"
+        valid_fence = (
+            '```json\n{"gate_type": "design", "summary": "ok", '
+            '"key_points": ["a"]}\n```'
+        )
+
+        d = CLIDispatcher(work_dir=work_dir, campaign=campaign)
+        with patch("orchestrator.cli_dispatch.subprocess.run") as mock_run:
+            mock_run.return_value = _success_result(valid_fence)
+            d._retry_cli_parse(previous_bad, ValueError("no fence"), "json")
+
+        stdin_text = mock_run.call_args.kwargs["input"]
+        assert stdin_text.startswith(previous_bad)
+
+    def test_retry_cli_schema_prompt_starts_with_previous_response(
+        self, work_dir: Path, campaign: dict,
+    ) -> None:
+        from unittest.mock import patch
+        from orchestrator.cli_dispatch import CLIDispatcher
+
+        previous_bad = '```json\n{"wrong_key": true}\n```'
+        valid_fence = (
+            '```json\n{"gate_type": "design", "summary": "ok", '
+            '"key_points": ["a"]}\n```'
+        )
+
+        schema = load_schema("gate_summary.schema.json")
+        try:
+            jsonschema.validate({"wrong_key": True}, schema)
+        except jsonschema.ValidationError as exc:
+            validation_error = exc
+
+        d = CLIDispatcher(work_dir=work_dir, campaign=campaign)
+        with patch("orchestrator.cli_dispatch.subprocess.run") as mock_run:
+            mock_run.return_value = _success_result(valid_fence)
+            d._retry_cli_schema(
+                previous_bad, validation_error, "json", "gate_summary.schema.json"
+            )
+
+        stdin_text = mock_run.call_args.kwargs["input"]
+        assert stdin_text.startswith(previous_bad)
+
+    def test_dispatch_parse_retry_does_not_resend_full_context(
+        self, work_dir: Path, campaign: dict,
+    ) -> None:
+        """On a parse error, the retry subprocess call gets the bad response, not the full prompt."""
+        from unittest.mock import patch
+        from orchestrator.cli_dispatch import CLIDispatcher
+
+        BAD_RESPONSE = "SENTINEL_BAD_NO_FENCE_xyz"
+        valid_fence = (
+            '```json\n{"gate_type": "design", "summary": "ok", '
+            '"key_points": ["tested"]}\n```'
+        )
+
+        with patch("orchestrator.cli_dispatch.subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                _success_result(BAD_RESPONSE),
+                _success_result(valid_fence),
+            ]
+            d = CLIDispatcher(work_dir=work_dir, campaign=campaign)
+            out = work_dir / "runs" / "iter-1" / "gate.json"
+            d.dispatch("summarizer", "summarize-gate", output_path=out, iteration=1)
+
+        assert mock_run.call_count == 2
+        first_input = mock_run.call_args_list[0].kwargs["input"]
+        retry_input = mock_run.call_args_list[1].kwargs["input"]
+
+        assert "TestSystem" in first_input        # full context went to first call
+        assert BAD_RESPONSE in retry_input         # retry contains the bad response
+        assert "TestSystem" not in retry_input     # retry does NOT re-send full context
