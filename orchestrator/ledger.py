@@ -123,11 +123,14 @@ def _collect_ablation_results(arms: list[dict]) -> dict[str, str]:
 
 
 def _compute_accuracy(arms: list[dict]) -> dict | None:
-    """Compute prediction accuracy across all arms."""
+    """Compute prediction accuracy across arms that were actually run."""
     if not arms:
         return None
-    total = len(arms)
-    correct = sum(1 for a in arms if a.get("status") == "CONFIRMED")
+    runnable = [a for a in arms if a.get("status") != "SKIPPED"]
+    if not runnable:
+        return None
+    total = len(runnable)
+    correct = sum(1 for a in runnable if a.get("status") == "CONFIRMED")
     return {
         "arms_correct": correct,
         "arms_total": total,

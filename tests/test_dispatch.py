@@ -76,6 +76,31 @@ class TestStubDispatcher:
         assert findings["arms"][0]["status"] == "REFUTED"
         jsonschema.validate(findings, _load_schema("findings.schema.json"))
 
+    def test_dispatch_executor_refuted_fast_fails_ablation(self, work_dir):
+        dispatcher = _make_dispatcher(work_dir)
+        iter_dir = work_dir / "runs" / "iter-1"
+        dispatcher.dispatch(
+            "executor", "execute-analyze",
+            output_path=iter_dir / "executor_log.md", iteration=1, h_main_result="REFUTED",
+        )
+        findings = json.loads((iter_dir / "findings.json").read_text())
+        jsonschema.validate(findings, _load_schema("findings.schema.json"))
+        statuses = {a["arm_type"]: a["status"] for a in findings["arms"]}
+        assert statuses["h-main"] == "REFUTED"
+        assert statuses["h-ablation"] == "SKIPPED"
+        assert statuses["h-control-negative"] == "CONFIRMED"
+
+    def test_dispatch_executor_confirmed_runs_ablation(self, work_dir):
+        dispatcher = _make_dispatcher(work_dir)
+        iter_dir = work_dir / "runs" / "iter-1"
+        dispatcher.dispatch(
+            "executor", "execute-analyze",
+            output_path=iter_dir / "executor_log.md", iteration=1, h_main_result="CONFIRMED",
+        )
+        findings = json.loads((iter_dir / "findings.json").read_text())
+        statuses = {a["arm_type"]: a["status"] for a in findings["arms"]}
+        assert statuses["h-ablation"] == "CONFIRMED"
+
     def test_dispatch_unknown_role_rejected(self, work_dir):
         dispatcher = _make_dispatcher(work_dir)
         with pytest.raises(ValueError, match="Unknown role"):

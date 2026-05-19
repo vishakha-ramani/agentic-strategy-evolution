@@ -238,6 +238,47 @@ class TestAppendLedgerRow:
         ledger = json.loads((tmp_path / "ledger.json").read_text())
         assert len(ledger["iterations"]) == 1
 
+    def test_accuracy_excludes_skipped_arms(self, tmp_path):
+        iter_dir = tmp_path / "runs" / "iter-1"
+        _write_bundle(iter_dir)
+        findings = {
+            "iteration": 1,
+            "bundle_ref": "runs/iter-1/bundle.yaml",
+            "arms": [
+                {
+                    "arm_type": "h-main",
+                    "predicted": "p", "observed": "o",
+                    "status": "REFUTED",
+                    "error_type": "direction", "diagnostic_note": None,
+                },
+                {
+                    "arm_type": "h-ablation",
+                    "predicted": "p", "observed": "skipped — h-main refuted",
+                    "status": "SKIPPED",
+                    "error_type": None, "diagnostic_note": "fast-fail: h-main refuted",
+                },
+                {
+                    "arm_type": "h-control-negative",
+                    "predicted": "p", "observed": "o",
+                    "status": "CONFIRMED",
+                    "error_type": None, "diagnostic_note": None,
+                },
+            ],
+            "experiment_valid": True,
+            "discrepancy_analysis": "H-main refuted.",
+        }
+        (iter_dir / "findings.json").write_text(json.dumps(findings, indent=2))
+        _write_principles(tmp_path, [])
+
+        append_ledger_row(tmp_path, 1)
+
+        ledger = json.loads((tmp_path / "ledger.json").read_text())
+        row = ledger["iterations"][0]
+        # Only 2 runnable arms (h-main REFUTED, h-control CONFIRMED); h-ablation SKIPPED excluded
+        assert row["prediction_accuracy"]["arms_total"] == 2
+        assert row["prediction_accuracy"]["arms_correct"] == 1
+        assert row["prediction_accuracy"]["accuracy_pct"] == 50.0
+
     def test_no_bundle_still_works(self, tmp_path):
         iter_dir = tmp_path / "runs" / "iter-1"
         iter_dir.mkdir(parents=True)

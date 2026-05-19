@@ -97,6 +97,13 @@ class StubDispatcher:
                     "diagnostic": "Stub: check if effect exists",
                 },
                 {
+                    "type": "h-ablation",
+                    "component": "stub-component",
+                    "prediction": "Stub: removing stub-component degrades performance",
+                    "mechanism": "Stub: component is essential to the mechanism",
+                    "diagnostic": "Stub: check component-level contribution",
+                },
+                {
                     "type": "h-control-negative",
                     "prediction": "Stub: no effect at low load",
                     "mechanism": "Stub: mechanism irrelevant without contention",
@@ -144,6 +151,7 @@ class StubDispatcher:
         iter_dir = path.parent
         iter_dir.mkdir(parents=True, exist_ok=True)
 
+        fast_failed = h_main_result == "REFUTED"
         plan = {
             "metadata": {
                 "iteration": iteration,
@@ -163,6 +171,15 @@ class StubDispatcher:
                         {
                             "name": "treatment",
                             "cmd": "echo '{\"latency_ms\": 40}'",
+                        },
+                    ],
+                },
+                {
+                    "arm_id": "h-ablation",
+                    "conditions": [
+                        {
+                            "name": "ablation",
+                            "cmd": "echo '{\"latency_ms\": 55}'",
                         },
                     ],
                 },
@@ -194,6 +211,18 @@ class StubDispatcher:
                     "diagnostic_note": None
                     if h_main_result == "CONFIRMED"
                     else "Mechanism does not hold",
+                },
+                {
+                    "arm_type": "h-ablation",
+                    "predicted": "removing stub-component degrades performance",
+                    "observed": "stub-component removal increased latency by 10%"
+                    if not fast_failed
+                    else "skipped — h-main refuted",
+                    "status": "CONFIRMED" if not fast_failed else "SKIPPED",
+                    "error_type": None,
+                    "diagnostic_note": None
+                    if not fast_failed
+                    else "fast-fail: h-main refuted",
                 },
                 {
                     "arm_type": "h-control-negative",

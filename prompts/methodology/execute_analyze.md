@@ -122,6 +122,10 @@ After each baseline+treatment pair with the same seed, compare key metrics. If t
 
 **All results must land in `{{iter_dir}}/results/`.** The worktree is temporary — anything written there will be lost.
 
+**Fast-fail rule:** After running h-main and before running any h-ablation, h-super-additivity, or h-robustness arms, evaluate the h-main result:
+- If h-main is **REFUTED**: do NOT run h-ablation, h-super-additivity, or h-robustness arms. Record each skipped arm in findings with `status: "SKIPPED"`, `observed: "skipped — h-main refuted"`, `error_type: null`, and `diagnostic_note: "fast-fail: h-main refuted"`. Continue with h-control-negative as planned, then proceed to Phase 3.
+- If h-main is **CONFIRMED** or **PARTIALLY_CONFIRMED**: run all remaining arms as planned.
+
 ## Phase 3: Analyze and Write Findings
 
 Compare the predictions in the hypothesis bundle against the metrics you observed.
