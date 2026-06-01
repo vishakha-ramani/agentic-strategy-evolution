@@ -1,0 +1,112 @@
+research_question: >
+  BLIS (github.com/vishakha-ramani/inference-sim, branch feat/dpp-decider) ships
+  two production-relevant P/D disaggregation routing policies:
+
+    (A) PrefixThresholdDecider  --pd-decider=prefix-threshold  --pd-prefix-threshold=N
+        Disaggregates when uncached prefill tokens > N. This is the llm-d production
+        heuristic (N=16 default). Stateless: reacts only to KV cache state, ignores
+        queue depths and TTFT feedback entirely.
+
+    (B) DriftPlusPenaltyDecider  --pd-decider=dpp  --dpp-v=V
+        Lyapunov optimization / Drift-Plus-Penalty algorithm. Disaggregates iff:
+            η·Q_D + V·c_D/2  >  Q_P + Z·ΔT/W_P
+        where Q_P, Q_D are aggregate prefill/decode queue depths observed at decision
+        time, Z is a virtual TTFT queue updated as Z ← max(0, Z + TTFT_last − d),
+        V is a penalty weight, and d is the TTFT SLO target. DPP is queue-aware
+        and TTFT-SLO-aware, but ignores per-request KV cache state.
+
+  CENTRAL QUESTION: Does DPP empirically beat PrefixThresholdDecider on mean ITL
+  while keeping TTFT comparable, purely from what BLIS has today? No paper analysis
+  assumed — we treat DPP as a black-box queue-state controller and ask: does having
+  queue + TTFT feedback help more than having cache-state feedback?
+
+  Proposed plan:
+
+  ITER-1 — Characterize the baseline. Run three static policies
+  (NeverDisaggregate, AlwaysDisaggregate, PrefixThreshold N=16) on a rate sweep
+  covering low/medium/high load. Goal: find the load regime where PrefixThreshold
+  beats Never and Almost, and understand the ITL–TTFT tradeoff each policy makes.
+  Use a workload with a mix of prefix-heavy and prefix-light requests so the cache
+  signal is informative.
+
+  ITER-2 — DPP V sweep. At 2–3 load points identified in iter-1, sweep
+  V ∈ {1, 10, 100, 1000} (and η=1.0, d=50ms). Find the V regime where DPP
+  wins on ITL vs the best PrefixThreshold result from iter-1.
+
+  ITER-3 — Head-to-head. Best DPP(V*) vs PrefixThreshold(N=16) on the full
+  rate sweep. Confirm the winner and characterize the conditions (load level,
+  cache hit rate, queue depth) under which DPP's queue-state feedback provides
+  an advantage.
+
+run_id: dpp-vs-prefix-threshold
+
+max_iterations: 3
+
+target_system:
+  name: "BLIS — DPP vs PrefixThreshold disaggregation decider"
+  description: >
+    BLIS (github.com/vishakha-ramani/inference-sim, branch feat/dpp-decider) is a
+    discrete-event simulator for LLM inference serving with P/D disaggregation.
+
+    Build: cd to repo_path, run  go build -o blis .  (requires Go 1.21+).
+    Run:   ./blis run [flags]
+
+    Topology: 1 prefill instance (--prefill-instances 1) + 1 decode instance
+    (--decode-instances 1). Model: qwen/qwen3-14b (--model qwen/qwen3-14b).
+    Latency model: trained-physics (--latency-model trained-physics, the default).
+
+    Workload design for a fair comparison:
+      Use TWO workload groups to create a mix of prefix-heavy and prefix-light
+      requests (so PrefixThresholdDecider has useful cache signal):
+        Group 1 (50%): --input-tokens 512 --prefix-tokens 480  → ~32 uncached tokens
+        Group 2 (50%): --input-tokens 512 --prefix-tokens 0    → 512 uncached tokens
+      Output tokens: --output-tokens 128 (fixed).
+      NOTE: BLIS workload YAML (v2 spec) supports multiple client groups. Use it.
+      Single-group runs with --prefix-tokens are also acceptable for quick probes.
+
+    Decider CLI flags:
+      --pd-decider never                         NeverDisaggregate (always local)
+      --pd-decider always                        AlwaysDisaggregate
+      --pd-decider prefix-threshold              PrefixThresholdDecider
+        --pd-prefix-threshold N                  threshold (default 16)
+      --pd-decider dpp                           DriftPlusPenaltyDecider
+        --dpp-v V                                penalty weight (default 100)
+        --dpp-eta 1.0                            queue weight ratio (default 1.0)
+        --dpp-ttft-slo-d 50.0                    TTFT SLO in ms (default 50)
+
+    Rate and request count:
+      --rate LAMBDA    requests/sec (Poisson)
+      --num-requests N  total requests to simulate (use >= 2000 for stable metrics)
+
+    Key output metrics (from BLIS stdout JSON summary):
+      mean_itl_ms, mean_ttft_ms, p99_itl_ms, p99_ttft_ms,
+      disaggregation_fraction, prefill_server_utilization, decode_server_utilization
+
+  observable_metrics:
+    - mean_itl_ms
+    - mean_ttft_ms
+    - p99_itl_ms
+    - p99_ttft_ms
+    - disaggregation_fraction
+    - prefill_server_utilization
+    - decode_server_utilization
+    - cache_hit_rate
+
+  controllable_knobs:
+    - pd_decider               # never | always | prefix-threshold | dpp
+    - pd_prefix_threshold      # N for prefix-threshold (default 16)
+    - dpp_v                    # V for DPP (default 100)
+    - dpp_eta                  # η for DPP (default 1.0)
+    - dpp_ttft_slo_d           # TTFT SLO target in ms (default 50)
+    - arrival_rate_lambda      # requests/sec; main load knob
+    - input_tokens_n           # fixed at 512
+    - output_tokens_m          # fixed at 128
+    - prefix_tokens            # per group, controls cache signal to PrefixThreshold
+    - prefill_instances        # fixed at 1
+    - decode_instances         # fixed at 1
+
+  repo_path: /Users/vishakha/git-repos/llm-git-repos/inference-sim
+
+prompts:
+  methodology_layer: "prompts/methodology"
+  domain_adapter_layer: null

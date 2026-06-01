@@ -128,6 +128,8 @@ class HumanGate:
                 print("\nAborted by user.")
                 logger.info("Gate aborted by KeyboardInterrupt")
                 raise
+            if not answer:
+                continue
             if answer in VALID_DECISIONS:
                 reason = None
                 if answer == "reject":
