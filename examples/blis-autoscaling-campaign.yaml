@@ -1,0 +1,228 @@
+research_question: >
+  The BLIS V2SaturationAnalyzer (ported from llm-d WVA V2) uses fixed token-based thresholds
+  to drive scale-up and scale-down. The Phase 2 analyzer trace (docs/plans/2026-05-12-autoscaling-
+  phase2-analyzer-trace.md in the inference-sim repo) exposes a concrete cost inefficiency: at
+  rate=22 req/s, the analyzer scales the cluster to 3 replicas (2 would have sufficed) and holds
+  all three for 240 s of idle stabilization before scale-down fires. The overshoot arises because
+  UnlimitedEngine dispatches delta=+2 on first actuation — it fills the full RequiredCapacity gap
+  in one shot without accounting for the loading delay that will naturally reduce demand.
+
+  CENTRAL QUESTION: Within the discovery space of (a) predictive demand forecasting,
+  (b) multi-metric combination formulas, and (c) hysteresis-curve thresholds, which autoscaler
+  design achieves the minimum GPU cost (replica-hours) while keeping p99 TTFT ≤ 500 ms under
+  a step-workload λ: 10 → 25 → 10 req/s on BLIS (Llama-2-7b-hf, H100, TP=1)?
+
+  Three dimensions to explore:
+    (a) PREDICTIVE: Does forecasting demand Δ=3–5 min ahead using a per-tick arrival rate EMA
+        allow right-sized scale-up (avoiding the 3-replica overshoot) and earlier scale-down?
+    (b) MULTI-METRIC: Does combining queue depth + KV utilization + per-replica AvgInTokens/
+        AvgOutTokens (populated in commit 87e5a7ba) into a weighted demand signal reduce
+        overshoot vs. the current token-only signal?
+    (c) HYSTERESIS: Do state-dependent thresholds — post-scale-up, raise the scale-down floor
+        by HysteresisGap for HysteresisWindowUs — cut flap cost without a separate
+        stabilization window?
+
+  BASELINE TO BEAT: V2SaturationAnalyzer, scale_up_threshold=0.85, scale_down_boundary=0.70,
+  240 s stabilization windows, loading_delay mean=240 s. Phase 2 shows this produces the
+  3-replica overshoot and ~420 s of excess GPU-time under the step workload.
+
+  ITER-1 — Cost metric + baseline characterization.
+  The BLIS metrics output does not currently include a cost metric. Add mean_active_replicas
+  (time-weighted integral of active replica count over the horizon) and total_gpu_cost_usd
+  (= mean_active_replicas × cost_per_hour × horizon_s / 3600) to sim/metrics.go and
+  sim/cluster/cluster.go. Also add ArrivalRatePerSec float64 to ModelSignals in
+  sim/cluster/autoscaler.go — count arrivals per autoscaler tick window in cluster.go and
+  expose it through DefaultCollector. These additions are needed before any algorithm can
+  be compared on cost.
+  Then run the V2SaturationAnalyzer baseline under the step workload (policy bundle:
+  docs/configs/phase2-autoscaler.yaml with scale_up=0.85, scale_down=0.70, windows=240 s).
+  Quantify: total_gpu_cost_usd, p99_ttft_ms per phase (low-load / step / recovery),
+  scale_up_count, scale_down_count, and excess replica-seconds wasted during idle stabilization.
+  DELIVERABLE: Precise baseline cost-SLO point. Numerical characterization of the overshoot.
+
+  ITER-2 — Best-promising algorithm prototype.
+  Based on iter-1 findings, select the most promising dimension:
+    • If overshoot dominates (delta=+2 fires when delta=+1 would have sufficed) → implement
+      PredictiveAnalyzer: add predictive_analyzer.go to sim/cluster/, implement Analyzer
+      interface, use ArrivalRatePerSec + mean service time to forecast demand Δ ahead and
+      compute a right-sized delta. Tune prediction_horizon_us ∈ {180s, 240s, 300s}.
+    • If idle over-provisioning after load drop dominates → implement HysteresisAnalyzer:
+      add hysteresis_analyzer.go to sim/cluster/, extend V2SaturationAnalyzer with a
+      post-scale-up state that raises the effective scale_down_boundary by hysteresis_gap
+      for hysteresis_window_us, enabling faster scale-down without thrashing.
+    • If demand signal noise causes jitter on the step boundary → implement MultiMetricAnalyzer:
+      add multi_metric_analyzer.go to sim/cluster/, compute
+      demand_score = w_kv*KvTokensInUse + w_q*QueueDepth*AvgInTokens; tune weights.
+      (TTFT-based terms require adding a rolling TTFT tracker to InstanceSimulator first —
+      use the same O(1) accessor pattern as AvgInputTokens() from commit 87e5a7ba.)
+  All new analyzers implement the existing Analyzer interface (Analyze(ModelSignals) AnalyzerResult).
+  Add analyzer_type field to the autoscaler YAML bundle (autoscaler.analyzer.type) and a
+  factory switch in sim/cluster/cluster.go or sim/bundle.go.
+  Compare cost-SLO vs. baseline. Report total_gpu_cost_usd, p99_ttft_ms, scale_up_count.
+  DELIVERABLE: First candidate algorithm implementation. Cost improvement delta.
+
+  ITER-3 — Refine + explore second dimension.
+  Tune the iter-2 algorithm (prediction horizon, metric weights, or hysteresis curve shape).
+  If iter-2 shows clear improvement, explore a second dimension from the discovery space.
+  For each candidate, produce a Pareto curve: sweep the primary threshold knob and plot
+  (total_gpu_cost_usd, ttft_slo_violation_rate) pairs.
+  DELIVERABLE: Refined candidate(s). Pareto curves showing cost vs. SLO violation rate.
+  Identify the design that minimises cost at ≤2% SLO violation rate.
+
+  ITER-4 — Adversarial validation.
+  Test the best iter-3 algorithm under a bursty arrival process (arrival.process=gamma, CV=1.5,
+  aggregate_rate=20 req/s, near-saturation). Verify the discovered algorithm does not regress
+  on flap_count or ttft_slo_violation_rate relative to V2Saturation under non-Poisson arrivals.
+  DELIVERABLE: Stability comparison table. Recommendation of the best algorithm configuration
+  as a BLIS YAML policy bundle that can be shipped as an example.
+
+  ANCHORS (established pre-campaign — do NOT re-derive):
+    • Model: meta-llama/Llama-2-7b-hf, Hardware: H100, TP=1
+    • (n, m) = (512, 128) tokens
+    • TotalKvCapacityTokens = 110,176  (from blis run --log debug, phase2-autoscaler.yaml)
+    • k1 = 88,141 tokens  (= TotalKvCapacityTokens × KvCacheThreshold=0.8)
+    • Single-replica saturation cliff: ~21–22 req/s
+    • λ_low = 10 req/s  (safe single-replica operation)
+    • λ_high = 25 req/s  (above cliff)
+    • TTFT SLO D = 500 ms p99
+    • cost_per_hour = 3.00 $/hr  (H100 representative)
+    • Autoscaler tick: 30 s (interval_us=30_000_000)
+    • Loading delay: mean=240 s, stddev=30 s
+    • Simulation horizon: 1800 s  (3 × 600 s phases: low → high → low)
+    • Scale-up stabilization window: 120 s  (reduced from WVA 240 s for responsiveness)
+    • Scale-down stabilization window: 240 s  (WVA production parity)
+    • Latency model: trained-physics
+    • Branch: feat/dpp-decider @ 87e5a7ba
+
+  STEP WORKLOAD (implemented via two ClientSpecs with LifecycleSpec.Windows):
+    • Client A: always active, rate_fraction=0.4  →  10 req/s throughout
+    • Client B: lifecycle windows=[{start_us=600_000_000, end_us=1_200_000_000}],
+      rate_fraction=0.6  →  15 req/s added during step; aggregate = 25 req/s during step
+
+run_id: blis-autoscaling-discovery
+
+max_iterations: 4
+
+target_system:
+  name: "BLIS — model autoscaler algorithm discovery"
+  description: >
+    BLIS (github.com/vishakha-ramani/inference-sim, branch feat/dpp-decider @ 87e5a7ba) is a
+    discrete-event LLM inference simulator. The autoscaler pipeline fires every interval_us of
+    simulated time:
+
+      ScalingTickEvent
+        → DefaultCollector.Collect(*RouterState) → []ModelSignals
+        → for each model: Analyzer.Analyze(ModelSignals) → AnalyzerResult
+        → Engine.Optimize([]AnalyzerResult, GPUInventory) → []ScaleDecision
+        → schedule ScaleActuationEvent after HPAScrapeDelay
+        → DirectActuator.Apply(ScaleDecision)
+
+    The current Analyzer is V2SaturationAnalyzer (sim/cluster/saturation_analyzer.go), which
+    computes per-replica capacity = min(k1, k2) in token units. Commit 87e5a7ba adds dynamic
+    demand estimation (per-replica observed AvgInTokens/AvgOutTokens, now populated via
+    O(1) accessors on InstanceSimulator) and k2 compute-bound capacity (WVA steady-state
+    batch formula: nSteady = B*O/(I+O), k2 = nSteady*(I+O/2), maintained as a rolling
+    average of size 10). Effective capacity = min(k1, k2).
+
+    Per-replica signals currently populated in ReplicaMetrics (sim/cluster/autoscaler.go):
+      KvTokensInUse, QueueDepth, InFlightCount, CostPerHour, TotalKvCapacityTokens,
+      AvgInTokens (✅ new in 87e5a7ba), AvgOutTokens (✅ new in 87e5a7ba), MaxBatchSize.
+    Signals currently zero (removed from hot path in #1382):
+      TTFT, DispatchRate, ITL.
+
+    New analyzers must implement the Analyzer interface in sim/cluster/autoscaler.go:
+      type Analyzer interface {
+          Analyze(metrics ModelSignals) AnalyzerResult
+          Name() string
+      }
+    Place new files in sim/cluster/ (e.g., predictive_analyzer.go). Wire via an
+    analyzer_type field in the autoscaler YAML bundle (autoscaler.analyzer.type) and
+    a factory switch in sim/cluster/cluster.go or sim/bundle.go.
+
+    The autoscaler YAML config lives in docs/configs/phase2-autoscaler.yaml and is
+    passed to blis via --policy-config. The autoscaler section controls:
+      interval_us, scale_up_stabilization_window_us, scale_down_stabilization_window_us,
+      hpa_scrape_delay, and analyzer sub-config (kv_cache_threshold, scale_up_threshold,
+      scale_down_boundary, avg_input_tokens).
+
+    Node pool config (node_pools section in the policy bundle) controls max_nodes, initial_nodes,
+    cost_per_hour, and provisioning_delay. instance_lifecycle.loading_delay controls the
+    model-loading latency for newly placed replicas.
+
+    Run command pattern:
+      ./blis run \
+        --model meta-llama/Llama-2-7b-hf \
+        --latency-model trained-physics --hardware H100 --tp 1 \
+        --num-instances 1 \
+        --policy-config <bundle.yaml> \
+        --workload custom --workload-config <clients.yaml> \
+        --num-requests 100000 --horizon 1800000000 \
+        --log info 2>run.log
+    Scale events: grep "[actuator] scale-up\|[actuator] scale-down" run.log
+
+  observable_metrics:
+    - mean_ttft_ms                  # primary SLO metric
+    - p99_ttft_ms                   # SLO target: ≤ 500 ms
+    - ttft_slo_violation_rate       # fraction of requests with TTFT > 500 ms
+    - mean_itl_ms
+    - p99_itl_ms
+    - throughput_rps
+    - mean_active_replicas          # time-weighted cost proxy; to be added in iter-1
+    - total_gpu_cost_usd            # = mean_active_replicas × cost_per_hour × horizon_s / 3600; to be added in iter-1
+    - scale_up_count                # from log: grep "[actuator] scale-up"
+    - scale_down_count              # from log: grep "[actuator] scale-down"
+    - flap_count                    # scale-up followed by scale-down within 2 × scale_up_stabilization_window_us
+    - prefill_server_utilization
+    - decode_server_utilization
+    - kv_utilization_mean
+
+  controllable_knobs:
+    # Algorithm selection
+    - analyzer_type                 # v2-saturation | predictive | multi-metric | hysteresis
+
+    # V2Saturation baseline knobs
+    - scale_up_threshold            # utilization fraction triggering scale-up
+    - scale_down_boundary           # utilization fraction below which scale-down is safe
+    - kv_cache_threshold            # fraction of KV capacity counted as effective supply
+
+    # Predictive knobs
+    - prediction_horizon_us         # forecast window: 180_000_000–300_000_000 (3–5 min)
+    - arrival_ema_alpha             # EMA decay for arrival rate estimate (0.1–0.5)
+
+    # Multi-metric knobs
+    - weight_kv                     # weight on KV token demand
+    - weight_queue                  # weight on queue token demand
+    - weight_ttft                   # weight on TTFT/SLO ratio signal (requires TTFT tracker)
+    - ttft_slo_target_us            # SLO target fed into multi-metric score
+
+    # Hysteresis knobs
+    - hysteresis_gap                # delta added to scale_down_boundary post-scale-up
+    - hysteresis_window_us          # duration of elevated threshold after scale-up
+
+    # Stabilization windows
+    - scale_up_stabilization_window_us
+    - scale_down_stabilization_window_us
+
+    # Workload
+    - aggregate_rate                # total λ; split by client lifecycle windows
+    - lambda_low                    # 10 req/s (client A always-on fraction)
+    - lambda_high                   # 25 req/s (client A + client B during step)
+    - step_start_us                 # 600_000_000 (600 s into simulation)
+    - step_end_us                   # 1_200_000_000 (1200 s into simulation)
+    - arrival_process               # poisson | gamma (iter-4 bursty test)
+    - arrival_cv                    # coefficient of variation; >1 for iter-4 adversarial
+
+    # Topology — pinned for this campaign
+    - num_instances                 # initial replicas at startup (1)
+    - max_nodes                     # node pool ceiling
+
+    # Hardware constants
+    - cost_per_hour                 # $/hr per H100 node (3.00)
+    - loading_delay_mean_s          # instance load time mean (240 s)
+    - loading_delay_stddev_s        # instance load time stddev (30 s)
+
+  repo_path: /Users/vishakha/git-repos/llm-git-repos/inference-sim
+
+prompts:
+  methodology_layer: "prompts/methodology"
+  domain_adapter_layer: null
