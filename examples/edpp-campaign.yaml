@@ -1,0 +1,125 @@
+research_question: >
+  EmpiricalDPPDecider (edpp) is a self-calibrating variant of DriftPlusPenaltyDecider
+  that eliminates all analytically-derived constants. Its decision rule is:
+
+      V · η · Q_D  >  Q_P  +  Z · κ̂
+
+  where:
+    V     — adaptive penalty weight, updated each epoch: V += α·(ITL_obs − ITL_target)/ITL_target
+    Z     — virtual TTFT queue: Z = max(0, Z + TTFT_obs − d)
+    κ̂    — empirical KV-transfer cost ratio: EWMA(ΔT_obs / W_P_approx)
+    d     — TTFT SLO target (operator-specified; default 100ms — a realistic production value)
+
+  Unlike the original DPP, edpp has NO additive constant V·c_D/2. Z and V can actually
+  swing the decision. V adapts from observed ITL so the operator only specifies goals
+  (ITL target, TTFT SLO), not system parameters.
+
+  Previous campaign (dpp-vs-prefix-threshold, 3 iterations) established:
+    - Original DPP(V=5, SLO=20ms) beats PrefixThreshold in 2P+2D by 10-30% on ITL,
+      but ONLY because SLO=20ms < min achievable disagg TTFT (~21ms), forcing Z to grow
+      from the first request and permanently suppress disaggregation.
+    - With a realistic SLO (≥22ms), Z stays zero and DPP reverts to AlwaysDisaggregate.
+    - The "win" was really a "keep local by default" policy, not adaptive behavior.
+
+  THIS CAMPAIGN tests edpp with realistic SLOs (100ms, 200ms) and realistic workloads
+  from the inference-perf catalog. The central question: does V adaptation let edpp find
+  a stable operating point that beats PrefixThreshold on ITL without the artificial SLO trick?
+
+  Two workloads (both v2 workload-spec YAMLs checked into the repo):
+    (A) interactive-chat  — short per-turn inputs (~50 tok), 5K prefix, ~4 turns, 300 tok output
+    (B) code-generation   — long per-turn inputs (~1500 tok), 30K prefix, ~15 turns, 425 tok output
+
+  These differ critically from the prior synthetic workload (fixed 512-tok input, 480-tok prefix):
+    - Per-request uncached token counts are VARIABLE (lognormal distribution)
+    - PrefixThreshold(N=16) now has heterogeneous signal: some requests have many uncached
+      tokens (should disaggregate), others have few (should stay local)
+    - The ITL target for V adaptation can be calibrated from Never's baseline
+
+  Proposed iterations:
+
+  ITER-1 — Characterize both workloads with Never/PT baselines in 2P+2D.
+  Establish saturation points, ITL/TTFT at key rates, and the distribution of
+  uncached token lengths (which determines how informative PT's cache signal is).
+  Calibrate appropriate edpp ITL targets from observed Never ITL.
+
+  ITER-2 — edpp vs PT on interactive-chat (short inputs, moderate prefix).
+  Run edpp with ITL target = 1.1× Never's observed ITL, SLO ∈ {100ms, 200ms}.
+  Sweep rates and observe V trajectory. Test whether V stabilizes and whether
+  edpp beats PT at medium-to-high load.
+
+  ITER-3 — edpp vs PT on code-generation (long inputs, large prefix).
+  Same structure as iter-2. Code-gen has more uncached tokens per turn, so PT
+  disaggregates more aggressively — a harder baseline for edpp to beat.
+
+run_id: edpp-realistic-workloads
+
+max_iterations: 3
+
+target_system:
+  name: "BLIS — EmpiricalDPP vs PrefixThreshold on inference-perf workloads"
+  description: >
+    BLIS (github.com/vishakha-ramani/inference-sim, branch feat/dpp-decider) with
+    EmpiricalDPPDecider added in sim/disaggregation_edpp.go.
+
+    Build: go build -o blis .  (requires Go 1.21+)
+
+    Topology for all experiments: 2P+2D
+      --num-instances 4 --prefill-instances 2 --decode-instances 2
+
+    Model: meta-llama/llama-3.3-70b-instruct  (matches inference-perf catalog)
+
+    Workload specs (v2 YAML, use --workload-spec flag):
+      Interactive-chat: inference-perf-interactive-chat.yaml  (in repo root)
+        prefix=5000, input lognormal(mu=3.665,sigma=0.703), output gaussian(300,150),
+        4 turns/session, rate default 5 req/s
+      Code-generation: inference-perf-code-generation.yaml  (in repo root)
+        prefix=30000, input lognormal(mu=7.066,sigma=0.703), output lognormal(5.271,1.25),
+        15 turns/session, rate default 2 req/s
+
+    EDPP decider flags:
+      --pd-decider edpp
+      --edpp-ttft-slo-d D      TTFT SLO in ms (default 100; test 100 and 200)
+      --edpp-itl-target T      ITL target in ms (set from Never baseline × 1.1)
+      --edpp-v-init 1.0        start V at 1.0 (moderate)
+      --edpp-v-min 0.05        floor: won't collapse to never-disaggregate
+      --edpp-v-max 50.0        ceiling: won't runaway to always-disaggregate
+      --edpp-alpha 0.1         V step size per epoch
+      --edpp-epoch-size 50     V update every 50 completed requests
+
+    PrefixThreshold baseline:
+      --pd-decider prefix-threshold --pd-prefix-threshold 16
+
+    Rate sweep: use --aggregate-rate when using --workload-spec to override the
+    spec's default aggregate_rate. Typical sweep: 2x, 5x, 10x, 20x the spec default.
+
+    Key metrics:
+      mean_itl_ms, mean_ttft_ms, p99_itl_ms, p99_ttft_ms,
+      disaggregation_fraction, dropped_unservable, preemption_count
+    Also log edpp's adaptive state (CurrentV, CurrentKappa) by adding a
+    post-run query or checking the executor log for the decider's final values.
+
+  observable_metrics:
+    - mean_itl_ms
+    - mean_ttft_ms
+    - p99_itl_ms
+    - p99_ttft_ms
+    - disaggregation_fraction
+    - dropped_unservable
+    - preemption_count
+
+  controllable_knobs:
+    - pd_decider              # never | prefix-threshold | edpp
+    - edpp_ttft_slo_d         # TTFT SLO in ms (100 or 200)
+    - edpp_itl_target         # ITL target in ms (from Never baseline)
+    - edpp_alpha              # V step size (default 0.1)
+    - edpp_epoch_size         # requests per V update (default 50)
+    - aggregate_rate          # overrides workload spec's aggregate_rate
+    - workload_spec           # inference-perf-interactive-chat.yaml or code-generation
+    - prefill_instances       # fixed at 2
+    - decode_instances        # fixed at 2
+
+  repo_path: /Users/vishakha/git-repos/llm-git-repos/inference-sim
+
+prompts:
+  methodology_layer: "prompts/methodology"
+  domain_adapter_layer: null
