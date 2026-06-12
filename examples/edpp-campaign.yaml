@@ -1,122 +1,173 @@
 research_question: >
-  EmpiricalDPPDecider (edpp) is a self-calibrating variant of DriftPlusPenaltyDecider
-  that eliminates all analytically-derived constants. Its decision rule is:
+  On a standard llm-d stack — default router and admission-control behaviour left
+  intact — does the tuning-free EmpiricalDPP decider (edpp) BEAT llm-d's default
+  static P/D decider on inter-token latency (ITL) and time-to-first-token (TTFT)?
 
-      V · η · Q_D  >  Q_P  +  Z · κ̂
+  The only independent variable across arms is the P/D disaggregation policy.
+  Router, admission control, topology, workload, request rate, and seed are held
+  IDENTICAL between the baseline arm and the edpp arm — so any latency difference
+  is attributable to the decider alone.
 
-  where:
-    V     — adaptive penalty weight, updated each epoch: V += α·(ITL_obs − ITL_target)/ITL_target
-    Z     — virtual TTFT queue: Z = max(0, Z + TTFT_obs − d)
-    κ̂    — empirical KV-transfer cost ratio: EWMA(ΔT_obs / W_P_approx)
-    d     — TTFT SLO target (operator-specified; default 100ms — a realistic production value)
+  edpp is a self-calibrating policy derived from Lyapunov drift-plus-penalty.
+  Decision rule (work-units, microseconds):
 
-  Unlike the original DPP, edpp has NO additive constant V·c_D/2. Z and V can actually
-  swing the decision. V adapts from observed ITL so the operator only specifies goals
-  (ITL target, TTFT SLO), not system parameters.
+      disaggregate  ⟺  u·(Q_D·rate_D − Q_P·rate_P) + V·Δp  >  Z·ΔTTFT
 
-  Previous campaign (dpp-vs-prefix-threshold, 3 iterations) established:
-    - Original DPP(V=5, SLO=20ms) beats PrefixThreshold in 2P+2D by 10-30% on ITL,
-      but ONLY because SLO=20ms < min achievable disagg TTFT (~21ms), forcing Z to grow
-      from the first request and permanently suppress disaggregation.
-    - With a realistic SLO (≥22ms), Z stays zero and DPP reverts to AlwaysDisaggregate.
-    - The "win" was really a "keep local by default" policy, not adaptive behavior.
+    u       — uncached input tokens of the request
+    Q_D     — Σ_decode  QueueDepth·(AvgOutTokens·ITL + AvgInTokens·rate_D)
+              (decode backlog incl. pending mixed-prefill of queued local reqs, µs)
+    Q_P     — Σ_prefill QueueDepth·AvgInTokens·rate_P (prefill backlog, µs)
+    rate_P  — LEARNED prefill rate on the dedicated prefill pool (µs/uncached tok)
+    rate_D  — LEARNED prefill rate on the mixed decode pool (µs/uncached tok)
+    Δp      — p_local − p_remote (learned two-population ITL gap)
+    ΔTTFT   — ttft_remote − ttft_local (learned two-population TTFT gap)
+    V       — FIXED operator knob; Z — virtual TTFT queue (Z←max(0,Z+TTFT−d)); d — TTFT SLO
 
-  THIS CAMPAIGN tests edpp with realistic SLOs (100ms, 200ms) and realistic workloads
-  from the inference-perf catalog. The central question: does V adaptation let edpp find
-  a stable operating point that beats PrefixThreshold on ITL without the artificial SLO trick?
+  Every system quantity is a two-population EWMA learned online — no per-model or
+  per-workload calibration. The central question is whether ONE fixed edpp config
+  beats the static default across LOAD and across two workloads that want OPPOSITE
+  routing (short-input chat → mostly local; long-input code-gen → mostly remote)
+  and across two topologies (2P+2D, 1P+3D), while self-limiting (Z bounded, prefill
+  pool not flooded) at saturation.
 
-  Two workloads (both v2 workload-spec YAMLs checked into the repo):
-    (A) interactive-chat  — short per-turn inputs (~50 tok), 5K prefix, ~4 turns, 300 tok output
-    (B) code-generation   — long per-turn inputs (~1500 tok), 30K prefix, ~15 turns, 425 tok output
+  This campaign is the MAIN "edpp beats static" effect. The ablation thread
+  (sensitivity to V, SLO d, topology, router/admission settings) is a SEPARATE
+  follow-up campaign — establish the effect first, dissect it later. The campaign
+  also stands alone: edpp learns its parameters at run time, so the only fixed
+  inputs are the operating-point knobs below. Whether this feeds a specific paper
+  claim is intentionally left open.
 
-  These differ critically from the prior synthetic workload (fixed 512-tok input, 480-tok prefix):
-    - Per-request uncached token counts are VARIABLE (lognormal distribution)
-    - PrefixThreshold(N=16) now has heterogeneous signal: some requests have many uncached
-      tokens (should disaggregate), others have few (should stay local)
-    - The ITL target for V adaptation can be calibrated from Never's baseline
-
-  Proposed iterations:
-
-  ITER-1 — Characterize both workloads with Never/PT baselines in 2P+2D.
-  Establish saturation points, ITL/TTFT at key rates, and the distribution of
-  uncached token lengths (which determines how informative PT's cache signal is).
-  Calibrate appropriate edpp ITL targets from observed Never ITL.
-
-  ITER-2 — edpp vs PT on interactive-chat (short inputs, moderate prefix).
-  Run edpp with ITL target = 1.1× Never's observed ITL, SLO ∈ {100ms, 200ms}.
-  Sweep rates and observe V trajectory. Test whether V stabilizes and whether
-  edpp beats PT at medium-to-high load.
-
-  ITER-3 — edpp vs PT on code-generation (long inputs, large prefix).
-  Same structure as iter-2. Code-gen has more uncached tokens per turn, so PT
-  disaggregates more aggressively — a harder baseline for edpp to beat.
-
-run_id: edpp-realistic-workloads
+run_id: edpp-vs-llmd-default
 
 max_iterations: 3
 
+# Per-phase model overrides (see orchestrator/defaults.yaml). Design phase uses
+# Opus 4.8 for stronger regime reasoning / hypothesis quality (was opus-4-6).
+models:
+  design: "claude-opus-4-8"
+
 target_system:
-  name: "BLIS — EmpiricalDPP vs PrefixThreshold on inference-perf workloads"
+  name: "BLIS — tuning-free EmpiricalDPP vs llm-d default static P/D (llama-3.3-70b)"
   description: >
-    BLIS (github.com/vishakha-ramani/inference-sim, branch feat/dpp-decider) with
-    EmpiricalDPPDecider added in sim/disaggregation_edpp.go.
+    BLIS (inference-sim, local checkout below) on branch feat/empirical-dpp:
+    EmpiricalDPPDecider in sim/disaggregation_edpp.go, p50/p90/p95/p99 + mean
+    emitted for ITL/TTFT/E2E.
 
-    Build: go build -o blis .  (requires Go 1.21+)
+    Build: from repo_path, `go build -o blis .`  (Go 1.24+).
 
-    Topology for all experiments: 2P+2D
-      --num-instances 4 --prefill-instances 2 --decode-instances 2
+    ── Standard llm-d stack (held IDENTICAL across all arms) ────────────────────
+    Model:        meta-llama/llama-3.3-70b-instruct  (in defaults.yaml)
+    Latency model: trained-physics (--latency-model trained-physics; default)
+    Topologies (run the claim on BOTH):
+        2P+2D  →  --num-instances 4 --prefill-instances 2 --decode-instances 2
+        1P+3D  →  --num-instances 4 --prefill-instances 1 --decode-instances 3
+    KV block size: 16 tokens (--block-size-in-tokens 16, default)
+    KV transfer (NIXL/RDMA-like): --pd-transfer-bandwidth 25 (GB/s),
+                                  --pd-transfer-base-latency 0.05 (ms)
+    Router + admission: left at the llm-d-default-equivalent and FIXED across arms.
+        Pin one routing policy + admission config in iter-1 and reuse it verbatim
+        for every baseline and edpp run. Do NOT vary router/admission in this
+        campaign (that is the separate ablation). The ONLY knob that differs
+        between arms is --pd-decider (and --pd-prefix-threshold for the baseline).
 
-    Model: meta-llama/llama-3.3-70b-instruct  (matches inference-perf catalog)
+    ── BASELINE = llm-d's DEFAULT static P/D decider ───────────────────────────
+    llm-d's default decider is PrefixBasedPDDecider (llm-d-router
+    pd_profile_handler.go: defaultDeciderPluginName), which disaggregates when the
+    UNCACHED suffix length ≥ nonCachedTokens. Its deployed default is
+    nonCachedTokens: 16 (deploy/config/pd-epp-config.yaml + sim configs + e2e).
+    BLIS models it on uncached tokens:
+        --pd-decider prefix-threshold --pd-prefix-threshold 16
+    (Semantic note: llm-d uses ≥, BLIS uses strict >; --pd-prefix-threshold 15
+    matches llm-d@16 exactly. Use 16 as the literal default; 15 only if exact
+    parity matters. NOTE: the separate, older PD_PROMPT_LEN_THRESHOLD=10 env is a
+    DIFFERENT prompt-length decider — not this default; do not use 10 here.)
+    To claim edpp beats not just the default but the BEST-tuned static threshold,
+    also sweep the static family:  --pd-prefix-threshold ∈ {8, 16, 32}
+    (≈ ½, 1, 2 KV blocks — realistic operator choices).
+    Reference brackets: --pd-decider never (all-local) and --pd-decider always.
 
-    Workload specs (v2 YAML, use --workload-spec flag):
-      Interactive-chat: inference-perf-interactive-chat.yaml  (in repo root)
-        prefix=5000, input lognormal(mu=3.665,sigma=0.703), output gaussian(300,150),
-        4 turns/session, rate default 5 req/s
-      Code-generation: inference-perf-code-generation.yaml  (in repo root)
-        prefix=30000, input lognormal(mu=7.066,sigma=0.703), output lognormal(5.271,1.25),
-        15 turns/session, rate default 2 req/s
+    ── CANDIDATE = edpp at its default operating point (ONE fixed config) ──────
+        --pd-decider edpp
+        --edpp-v 1.0             fixed penalty weight V (not adapted)
+        --edpp-epsilon 0.05      ε-exploration probability (seeded by --seed)
+        --edpp-beta 0.05         EWMA smoothing for learned rate/ITL/TTFT
+        --edpp-ttft-slo-d 100    TTFT SLO d in ms (drives the Z queue)
+    The same config is used for BOTH workloads and BOTH topologies — that is the
+    tuning-free claim. edpp exposes final CurrentZ/CurrentRates for logging.
 
-    EDPP decider flags:
-      --pd-decider edpp
-      --edpp-ttft-slo-d D      TTFT SLO in ms (default 100; test 100 and 200)
-      --edpp-itl-target T      ITL target in ms (set from Never baseline × 1.1)
-      --edpp-v-init 1.0        start V at 1.0 (moderate)
-      --edpp-v-min 0.05        floor: won't collapse to never-disaggregate
-      --edpp-v-max 50.0        ceiling: won't runaway to always-disaggregate
-      --edpp-alpha 0.1         V step size per epoch
-      --edpp-epoch-size 50     V update every 50 completed requests
+    ── Workloads (v2 specs in the inference-sim repo root; target llama-3.3-70b) ─
+    (A) inference-perf-interactive-chat.yaml — short turns (input lognormal
+        µ=3.665,σ=0.70 ≈50 tok/turn), shared prefix 5000, output gaussian(300,150),
+        4 turns, default aggregate_rate 5 req/s. After the cached prefix, uncached
+        suffixes are SHORT → a static threshold mostly keeps local.
+    (B) inference-perf-code-generation.yaml — long turns (input lognormal
+        µ=7.066,σ=0.70 ≈1500 tok/turn), prefix 30000, output lognormal(µ=5.271,
+        σ=1.25), 15 turns, default aggregate_rate 2 req/s. Long uncached suffixes
+        → a static threshold disaggregates aggressively.
+    These two workloads want OPPOSITE routing, which is the point: one fixed edpp
+    config should win on both, where any single static threshold is only right for one.
 
-    PrefixThreshold baseline:
-      --pd-decider prefix-threshold --pd-prefix-threshold 16
+    Load sweep: override the spec default with --aggregate-rate (≈2×,5×,10×,20× the
+    spec default, pushing toward saturation).
 
-    Rate sweep: use --aggregate-rate when using --workload-spec to override the
-    spec's default aggregate_rate. Typical sweep: 2x, 5x, 10x, 20x the spec default.
+    ── Metrics (compare distributions, not just the tail) ──────────────────────
+    For ITL and TTFT: mean, p50 (median), p90, p95, and p99 (p99 reported for
+    completeness; p50/p90/p95 are the headline stats). Plus dropped_unservable and
+    preemption_count as saturation guardrails, and disaggregation_fraction +
+    final Z / rate_P / rate_D to confirm self-limiting behaviour. A "win" = edpp
+    beats the static default (and ideally the best-tuned static) on ITL and TTFT
+    across the mean/p50/p90/p95 stats at matched load, without inflating
+    dropped_unservable.
 
-    Key metrics:
-      mean_itl_ms, mean_ttft_ms, p99_itl_ms, p99_ttft_ms,
-      disaggregation_fraction, dropped_unservable, preemption_count
-    Also log edpp's adaptive state (CurrentV, CurrentKappa) by adding a
-    post-run query or checking the executor log for the decider's final values.
+    ── Iteration plan ───────────────────────────────────────────────────────────
+    ITER-1 — Pin the fixed stack (routing + admission) and characterize the STATIC
+      baseline family. On both workloads × both topologies, sweep rate for
+      prefix-threshold ∈ {8,16,32} plus never/always brackets. Establish ITL/TTFT
+      distributions vs load, the disaggregation fraction each threshold produces,
+      the saturation point, and which static threshold is "best" per
+      (workload, topology, load). Sanity-check edpp(defaults) runs end-to-end with
+      Z bounded and a disaggregation fraction strictly between never and always.
+
+    ITER-2 — edpp (default config) vs the static family on interactive-chat ×
+      {2P+2D, 1P+3D}, rate sweep. The local-favouring workload: does the fixed edpp
+      config match/beat the best static threshold on ITL & TTFT (mean/p50/p90/p95)
+      without over-disaggregating? Inspect learned rate_D/rate_P and the Z trajectory.
+
+    ITER-3 — edpp (SAME config) vs the static family on code-generation ×
+      {2P+2D, 1P+3D}, rate sweep. The remote-favouring workload; 1P+3D stresses the
+      single prefill pool hardest, so this is where self-limiting matters most.
+      Combined with iter-2, the result shows ONE untuned edpp config beating static
+      P/D on BOTH opposite workloads and BOTH topologies — or maps exactly where it
+      does not (envelope of the claim).
 
   observable_metrics:
     - mean_itl_ms
-    - mean_ttft_ms
+    - p50_itl_ms
+    - p90_itl_ms
+    - p95_itl_ms
     - p99_itl_ms
+    - mean_ttft_ms
+    - p50_ttft_ms
+    - p90_ttft_ms
+    - p95_ttft_ms
     - p99_ttft_ms
     - disaggregation_fraction
     - dropped_unservable
     - preemption_count
 
   controllable_knobs:
-    - pd_decider              # never | prefix-threshold | edpp
-    - edpp_ttft_slo_d         # TTFT SLO in ms (100 or 200)
-    - edpp_itl_target         # ITL target in ms (from Never baseline)
-    - edpp_alpha              # V step size (default 0.1)
-    - edpp_epoch_size         # requests per V update (default 50)
-    - aggregate_rate          # overrides workload spec's aggregate_rate
-    - workload_spec           # inference-perf-interactive-chat.yaml or code-generation
-    - prefill_instances       # fixed at 2
-    - decode_instances        # fixed at 2
+    - pd_decider              # candidate: edpp | baseline: prefix-threshold | brackets: never, always
+    - pd_prefix_threshold     # static baseline family: default 16, sweep {8,16,32}
+    - edpp_v                  # fixed penalty weight V (default 1.0) — SAME across all runs
+    - edpp_epsilon            # ε-exploration probability (default 0.05)
+    - edpp_beta               # EWMA smoothing factor (default 0.05)
+    - edpp_ttft_slo_d         # TTFT SLO d in ms (default 100) — SAME across all runs
+    - prefill_instances       # 2 (for 2P+2D) or 1 (for 1P+3D)
+    - decode_instances        # 2 (for 2P+2D) or 3 (for 1P+3D)
+    - aggregate_rate          # overrides the workload spec's aggregate_rate (load sweep)
+    - workload_spec           # inference-perf-interactive-chat.yaml | inference-perf-code-generation.yaml
+    # Router + admission knobs are intentionally NOT swept here — fixed across arms;
+    # they belong to the separate ablation campaign.
 
   repo_path: /Users/vishakha/git-repos/llm-git-repos/inference-sim
 
